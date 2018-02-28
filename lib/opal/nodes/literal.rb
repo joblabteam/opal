@@ -213,42 +213,132 @@ module Opal
       handle :xstr
 
       def compile
-        children.each do |child|
-          case child.type
-          when :str
-            value = child.loc.expression.source
-            if expr? && children.size == 1
-              value = detect_and_remove_trailing_semicolon(value, child)
-            end
-            push Fragment.new(value, nil)
-          when :begin
-            push expr(child)
-          when :gvar, :ivar
-            push expr(child)
-          when :js_return
-            # A case for manually created :js_return statement in Compiler#returns
-            # Since we need to take original source of :str
-            # we have to use raw source
-            # so we need to combine "return" with "raw_source"
-            push 'return '
-            str = child.children.first
-            value = str.loc.expression.source
-            push Fragment.new(value, nil)
-          else
-            raise "Unsupported xstr part: #{child.type}"
+        should_add_semicolon = false
+        has_embeded_return   = false
+        returning, children  = unpack_return(self.children)
+        stripped_children    = strip_empty_children(children)
+        single_line          = single_line?(stripped_children)
+        single_child         = stripped_children.size == 1
+
+        if single_line
+          # If it's a single line we'll try to:
+          #
+          # - strip empty lines
+          # - remove a trailing `;`
+          # - detect an embedded `return`
+          # - prepend a `return` when needed
+          # - append a `;` when needed
+          # - warn the user not to use the semicolon in single-line x-strings
+
+          first_child = stripped_children.shift
+
+          if first_child.type == :str
+            first_value = first_child.loc.expression.source.strip
+            has_embeded_return = first_value =~ /^return\b/
           end
+
+          if returning && !has_embeded_return
+            push('return ')
+          end
+
+          last_child = stripped_children.pop || first_child
+          if last_child.type == :str
+            last_value = last_child.loc.expression.source.rstrip
+            if (returning || expr?) && last_value[-1] == ';'
+              compiler.warning(
+                'Removed semicolon ending x-string expression, interpreted as unintentional',
+                last_child.line,
+              )
+              last_value = last_value[0...-1]
+            end
+
+            should_add_semicolon = true if returning
+          end
+
+          if single_child
+            push Fragment.new(last_value, scope, last_child)
+          else
+            compile_child(first_child)
+            stripped_children.each { |c| compile_child(c) }
+            if last_child.type == :str
+              should_add_semicolon = false if first_child.type != :str
+              push Fragment.new(last_value, scope, last_child)
+            else
+              compile_child(last_child)
+            end
+          end
+
+        else
+          # Here we leave to the user the responsibility to add
+          # a return where it's due.
+          children.each { |c| compile_child(c) }
         end
 
         wrap '(', ')' if recv?
+        push ';' if should_add_semicolon
       end
 
-      def detect_and_remove_trailing_semicolon(value, node)
-        if value =~ /;\s*#{REGEXP_END}/
-          compiler.warning 'Do not terminate one-line xstr expression with semicolon', node.line
-          value.sub(/;\s*#{REGEXP_END}/, '')
+      def compile_child(child)
+        case child.type
+        when :str
+          value = child.loc.expression.source
+          push Fragment.new(value, scope, child)
+        when :begin, :gvar, :ivar
+          push expr(child)
         else
-          value
+          raise "Unsupported xstr part: #{child.type}"
         end
+      end
+
+      # Check if there's only one child or if they're all part of
+      # the same line (e.g. because of interpolations)
+      def single_line?(children)
+        (children.size == 1) ||
+          children.none? do |c|
+            c.type == :str && c.loc.expression.source.end_with?("\n")
+          end
+      end
+
+      # A case for manually created :js_return statement in Compiler#returns
+      # Since we need to take original source of :str we have to use raw source
+      # so we need to combine "return" with "raw_source"
+      def unpack_return(children)
+        first_child = children.first
+        returning   = false
+
+        if first_child.type == :js_return
+          returning = true
+          children = first_child.children
+        end
+
+        return returning, children
+      end
+
+      # Will remove empty :str lines coming from cosmetic newlines in x-strings
+      #
+      # @example
+      #   # this will generate two additional empty
+      #   # children before and after `foo()`
+      #   %x{
+      #     foo()
+      #   }
+      def strip_empty_children(children)
+        start_index = 0
+        end_index = children.size - 1
+
+        while start_index <= end_index &&
+              (child = children[start_index]).type == :str &&
+              child.loc.expression.source.rstrip.empty?
+          start_index += 1
+        end
+
+        while start_index <= end_index &&
+              (child = children[end_index]).type == :str &&
+              child.loc.expression.source.rstrip.empty?
+          end_index -= 1
+        end
+
+        children[start_index..end_index]
       end
     end
 
